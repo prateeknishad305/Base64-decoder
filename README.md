@@ -18,8 +18,8 @@ pkg install python git
 
 ```bash
 cd ~
-git clone https://github.com/prateeknishad305/pyb64decode.git
-cd pyb64decode
+git clone https://github.com/prateeknishad305/Base64-decoder.git
+cd Base64-decoder
 ```
 
 ### 3. TitanCrypt cipher packs (AES / Fernet / ChaCha)
