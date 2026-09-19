@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-"""Layered Python unpacker: Base64, Marshal, XOR, zlib/lzma/gzip/bz2, hex, rot."""
-
 from __future__ import annotations
 
 import argparse
@@ -22,8 +20,10 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 try:
+    from clean import clean_source
     from titan import is_titan, unpack_titan
 except ImportError:
+    from pyb64decode.clean import clean_source
     from pyb64decode.titan import is_titan, unpack_titan
 
 B64_RE = re.compile(
@@ -42,12 +42,35 @@ PY_MARKERS = (
     b"base64",
     b"zlib",
     b"lambda",
+    b"return ",
+    b"async ",
+    b"await ",
 )
 ZLIB_MAGICS = (b"\x78\x01", b"\x78\x5e", b"\x78\x9c", b"\x78\xda")
-KNOWN_XOR = (0x01, 0x13, 0x17, 0x37, 0x42, 0x55, 0x5A, 0x69, 0x7A, 0xAA, 0xAD, 0xDE, 0xFF)
+KNOWN_XOR = (
+    0x01, 0x0A, 0x0D, 0x13, 0x17, 0x21, 0x37, 0x42, 0x55, 0x5A,
+    0x69, 0x7A, 0x80, 0xAA, 0xAD, 0xBE, 0xC0, 0xDE, 0xEF, 0xFF,
+)
 B64_ALPHABET = re.compile(rb"^[A-Za-z0-9+/_\-]+={0,2}$")
 HEX_ALPHABET = re.compile(rb"^[0-9A-Fa-f]+$")
 B32_ALPHABET = re.compile(rb"^[A-Z2-7]+={0,6}$")
+_FAIL = object()
+
+WRAPPERS = (
+    b"exec(",
+    b"eval(",
+    b"marshal.loads",
+    b"base64.b64decode",
+    b"base64.urlsafe_b64decode",
+    b"zlib.decompress",
+    b"lzma.decompress",
+    b"gzip.decompress",
+    b"bz2.decompress",
+    b"bytes.fromhex",
+    b"codecs.decode",
+    b"_decrypt(",
+    b"TITAN_ENC_",
+)
 
 
 def looks_like_text(data: bytes) -> bool:
@@ -80,7 +103,10 @@ def trivial_ast(tree) -> bool:
         return False
     node = tree.body[0]
     if isinstance(node, ast.Expr):
-        return isinstance(node.value, (ast.Name, ast.Constant, ast.Str, ast.Num, ast.Bytes, ast.NameConstant))
+        return isinstance(
+            node.value,
+            (ast.Name, ast.Constant, ast.Str, ast.Num, ast.Bytes, ast.NameConstant),
+        )
     return False
 
 
@@ -88,7 +114,7 @@ def looks_like_python(data: bytes) -> bool:
     tree = parse_tree(data)
     if tree is None or trivial_ast(tree):
         return False
-    return any(m in data for m in PY_MARKERS) or True
+    return True
 
 
 def ast_ok(data: bytes) -> bool:
@@ -99,19 +125,10 @@ def ast_ok(data: bytes) -> bool:
 def finished_python(data: bytes) -> bool:
     if not ast_ok(data):
         return False
-    lowered = data[:4000].lower()
-    wrappers = (
-        b"exec(",
-        b"eval(",
-        b"marshal.loads",
-        b"base64.b64decode",
-        b"zlib.decompress",
-        b"lzma.decompress",
-        b"gzip.decompress",
-        b"bytes.fromhex",
-        b"codecs.decode",
-    )
-    return not any(w in lowered for w in wrappers)
+    if is_titan(data):
+        return False
+    lowered = data[:8000].lower()
+    return not any(w in lowered for w in WRAPPERS)
 
 
 def is_pyc(data: bytes) -> bool:
@@ -160,6 +177,8 @@ def score(data: bytes) -> int:
         n += 70
     if is_pyc(data):
         n += 40
+    if is_titan(data):
+        n += 60
     printable = sum(32 <= b <= 126 or b in (9, 10, 13) for b in data[:2048])
     n += printable // 80
     return n
@@ -189,12 +208,13 @@ def try_b64(data: bytes):
     padded = raw if raw.endswith(b"=") else raw + b"=" * pad
     for decoder in (base64.b64decode, base64.urlsafe_b64decode):
         try:
-            out = decoder(padded, validate=False) if decoder is base64.b64decode else decoder(padded)
-        except TypeError:
-            try:
+            if decoder is base64.b64decode:
+                try:
+                    out = decoder(padded, validate=False)
+                except TypeError:
+                    out = decoder(padded)
+            else:
                 out = decoder(padded)
-            except Exception:
-                continue
         except Exception:
             continue
         if out and out != raw:
@@ -208,6 +228,31 @@ def try_b32(data: bytes):
         return None
     try:
         out = base64.b32decode(raw)
+    except Exception:
+        return None
+    return out or None
+
+
+def try_b85(data: bytes):
+    raw = compact_ws(data)
+    if len(raw) < 16:
+        return None
+    for decoder in (base64.b85decode, base64.a85decode):
+        try:
+            out = decoder(raw)
+        except Exception:
+            continue
+        if out and out != raw:
+            return out
+    return None
+
+
+def try_b16(data: bytes):
+    raw = compact_ws(data).upper()
+    if len(raw) < 16 or len(raw) % 2 or not HEX_ALPHABET.fullmatch(raw):
+        return None
+    try:
+        out = base64.b16decode(raw)
     except Exception:
         return None
     return out or None
@@ -229,6 +274,10 @@ def try_compress(data: bytes):
     if magic2 in ZLIB_MAGICS:
         try:
             return zlib.decompress(data)
+        except Exception:
+            pass
+        try:
+            return zlib.decompress(data, -15)
         except Exception:
             return None
     if magic2 == b"\x1f\x8b":
@@ -267,8 +316,10 @@ def shift_bytes(data: bytes, n: int) -> bytes:
 
 def code_source_hint(code: types.CodeType):
     for const in code.co_consts:
-        if isinstance(const, str) and len(const) > 40 and looks_like_python(const.encode("utf-8", errors="replace")):
-            return const.encode("utf-8")
+        if isinstance(const, str) and len(const) > 40:
+            encoded = const.encode("utf-8", errors="replace")
+            if looks_like_python(encoded):
+                return encoded
         if isinstance(const, bytes) and len(const) > 40:
             if looks_like_python(const) or try_compress(const) or try_b64(const):
                 return const
@@ -282,9 +333,11 @@ def code_source_hint(code: types.CodeType):
 def disassemble(code: types.CodeType) -> bytes:
     buf = io.StringIO()
     buf.write("# marshal code object\n")
-    buf.write("# co_filename=%r co_name=%r co_firstlineno=%s\n" % (
-        code.co_filename, code.co_name, code.co_firstlineno
-    ))
+    buf.write(
+        "# co_filename=%r co_name=%r co_firstlineno=%s\n"
+        % (code.co_filename, code.co_name, code.co_firstlineno)
+    )
+    buf.write("# co_names=%r\n" % (code.co_names,))
     buf.write("# co_consts=%r\n" % (code.co_consts,))
     dis.dis(code, file=buf)
     for const in code.co_consts:
@@ -305,6 +358,16 @@ def literal_value(node):
         return node.n
     if isinstance(node, ast.NameConstant):
         return node.value
+    if isinstance(node, ast.JoinedStr):
+        parts = []
+        for value in node.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                parts.append(value.value)
+            elif isinstance(value, ast.Str):
+                parts.append(value.s)
+            else:
+                return None
+        return "".join(parts)
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
         v = literal_value(node.operand)
         if isinstance(v, (int, float)):
@@ -320,11 +383,9 @@ def literal_value(node):
     return None
 
 
-_FAIL = object()
-
-
 def _codecs_decode(args, kwargs):
     import codecs
+
     return codecs.decode(*args, **kwargs)
 
 
@@ -347,7 +408,17 @@ SAFE_ATTR = {
 
 def eval_node(node):
     if isinstance(node, ast.Name):
-        if node.id in ("base64", "zlib", "gzip", "lzma", "bz2", "marshal", "codecs", "bytes", "bytearray"):
+        if node.id in (
+            "base64",
+            "zlib",
+            "gzip",
+            "lzma",
+            "bz2",
+            "marshal",
+            "codecs",
+            "bytes",
+            "bytearray",
+        ):
             return node.id
         return _FAIL
     if isinstance(node, ast.Attribute):
@@ -357,6 +428,24 @@ def eval_node(node):
         if isinstance(parent, str):
             return (parent, node.attr)
         return _FAIL
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = eval_node(node.left)
+        right = eval_node(node.right)
+        if left is _FAIL or right is _FAIL:
+            return _FAIL
+        try:
+            return left + right
+        except Exception:
+            return _FAIL
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
+        left = eval_node(node.left)
+        right = eval_node(node.right)
+        if left is _FAIL or right is _FAIL:
+            return _FAIL
+        try:
+            return left * right
+        except Exception:
+            return _FAIL
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitXor):
         left = eval_node(node.left)
         right = eval_node(node.right)
@@ -425,9 +514,14 @@ def eval_call(node: ast.Call):
         except Exception:
             return _FAIL
         return _FAIL
-    if isinstance(func, ast.Name) and func.id in ("exec", "eval"):
+    if isinstance(func, ast.Name) and func.id in ("exec", "eval", "compile"):
         return args[0] if args else _FAIL
-    if isinstance(func, ast.Attribute) and func.attr == "fromhex" and isinstance(func.value, ast.Name) and func.value.id == "bytes":
+    if (
+        isinstance(func, ast.Attribute)
+        and func.attr == "fromhex"
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "bytes"
+    ):
         try:
             src = args[0]
             if isinstance(src, bytes):
@@ -504,11 +598,16 @@ def _payload_score(val):
 
 def extract_b64_blob(data: bytes):
     blobs = sorted(set(B64_RE.findall(data)), key=len, reverse=True)
-    for blob in blobs[:12]:
+    for blob in blobs[:16]:
         decoded = try_b64(blob)
         if decoded is None:
             continue
-        if score(decoded) >= 40 or try_compress(decoded) is not None or marshal_loads_code(decoded) is not None:
+        if (
+            score(decoded) >= 40
+            or try_compress(decoded) is not None
+            or marshal_loads_code(decoded) is not None
+            or is_titan(decoded)
+        ):
             return decoded
     return None
 
@@ -520,7 +619,8 @@ def useful_payload(data: bytes) -> bool:
         return True
     if marshal_loads_code(data) is not None:
         return True
-    if try_b64(data) is not None and score(try_b64(data)) > 40:
+    decoded = try_b64(data)
+    if decoded is not None and score(decoded) > 40:
         return True
     return False
 
@@ -556,7 +656,7 @@ def auto_xor(data: bytes):
 def maybe_shift(data: bytes):
     if looks_like_python(data) or marshal_loads_code(data) is not None:
         return None
-    for n in (-7, 7, -13, 13):
+    for n in (-7, 7, -13, 13, -1, 1):
         out = shift_bytes(data, n)
         if ast_ok(out) or marshal_loads_code(out) is not None:
             return out, n
@@ -580,15 +680,23 @@ def _to_bytes(current):
     return None
 
 
-def unwrap(data: bytes, max_layers: int = 64, xor_key=None) -> Result:
+def unwrap(data: bytes, max_layers: int = 64, xor_key=None, password=None) -> Result:
     layers = []
     current = data
     code_obj = None
-    if isinstance(current, (bytes, bytearray)) and is_titan(bytes(current)):
-        payload, tag = unpack_titan(bytes(current))
-        current = payload
-        layers.append(tag)
+    seen = set()
     for _ in range(max_layers):
+        raw = _to_bytes(current)
+        if raw is not None:
+            digest = (len(raw), hash(raw[:64]), hash(raw[-64:]) if len(raw) >= 64 else 0)
+            if digest in seen:
+                break
+            seen.add(digest)
+        if isinstance(current, (bytes, bytearray)) and is_titan(bytes(current)):
+            payload, tag = unpack_titan(bytes(current), password=password)
+            current = payload
+            layers.append(tag)
+            continue
         if isinstance(current, types.CodeType):
             code_obj = current
             hint = code_source_hint(current)
@@ -628,10 +736,20 @@ def unwrap(data: bytes, max_layers: int = 64, xor_key=None) -> Result:
             current = nxt
             layers.append("hex")
             continue
+        nxt = try_b16(current)
+        if nxt is not None and score(nxt) > score(current):
+            current = nxt
+            layers.append("base16")
+            continue
         nxt = try_b32(current)
         if nxt is not None and score(nxt) > score(current):
             current = nxt
             layers.append("base32")
+            continue
+        nxt = try_b85(current)
+        if nxt is not None and score(nxt) > score(current) and not ast_ok(current):
+            current = nxt
+            layers.append("base85")
             continue
         if looks_like_text(current):
             text = current.decode("utf-8", errors="replace")
@@ -674,7 +792,11 @@ def unwrap(data: bytes, max_layers: int = 64, xor_key=None) -> Result:
     if isinstance(current, types.CodeType):
         code_obj = current
         current = disassemble(current)
-    res = Result(_to_bytes(current) or b"", layers)
+    payload = _to_bytes(current) or b""
+    if ast_ok(payload):
+        payload = clean_source(payload)
+        layers.append("clean")
+    res = Result(payload, layers)
     res.code = code_obj
     return res
 
@@ -735,18 +857,34 @@ def selftest() -> int:
         ("zlib+b64", base64.b64encode(zlib.compress(src)), b"ok-layer"),
         ("xor", xor_src, b"ok-layer"),
         ("marshal+zlib+b64", base64.b64encode(zlib.compress(dumped)), b"ok-layer"),
-        ("exec-b64", ("exec(base64.b64decode(%r))\n" % base64.b64encode(src).decode("ascii")).encode(), b"ok-layer"),
-        ("exec-marshal", ("exec(marshal.loads(base64.b64decode(%r)))\n" % base64.b64encode(dumped).decode("ascii")).encode(), b"ok-layer"),
+        (
+            "exec-b64",
+            ("exec(base64.b64decode(%r))\n" % base64.b64encode(src).decode("ascii")).encode(),
+            b"ok-layer",
+        ),
+        (
+            "exec-marshal",
+            (
+                "exec(marshal.loads(base64.b64decode(%r)))\n"
+                % base64.b64encode(dumped).decode("ascii")
+            ).encode(),
+            b"ok-layer",
+        ),
         ("xor-b64", base64.b64encode(xor_src), b"ok-layer"),
         ("titan-b64", _titan_stub(base64.b64encode(src), method=1), b"ok-layer"),
         ("titan-xor", _titan_stub(xor_bytes(src, 0x5A), method=3), b"ok-layer"),
+        (
+            "nested-titan",
+            ("exec(base64.b64decode(%r))\n" % base64.b64encode(_titan_stub(base64.b64encode(src), 1)).decode("ascii")).encode(),
+            b"ok-layer",
+        ),
     ]
     failed = 0
     for name, blob, needle in cases:
         out = unwrap(blob)
         body = out.data
         if needle not in body:
-            print("FAIL", name, out.layers, body[:120], file=sys.stderr)
+            print("FAIL", name, out.layers, body[:160], file=sys.stderr)
             failed += 1
         else:
             print("PASS", name, "->", ",".join(out.layers) or "none", file=sys.stderr)
@@ -755,12 +893,14 @@ def selftest() -> int:
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Unwrap layered Python encoding: Base64, Marshal, XOR, zlib/lzma/gzip, hex, rot13."
+        description="Unwrap layered Python encoding and dump cleaned source."
     )
     p.add_argument("input", nargs="?", help="Obfuscated .py / payload file")
-    p.add_argument("-o", "--output", help="Write result to path")
+    p.add_argument("-o", "--output", help="Write cleaned Python to path")
     p.add_argument("--max-layers", type=int, default=64)
     p.add_argument("--xor-key", help="XOR key: 0x5A, 90, hex bytes, or ascii")
+    p.add_argument("--password", help="Override TitanCrypt password already in the stub")
+    p.add_argument("--no-clean", action="store_true", help="Skip ast.unparse cleanup")
     p.add_argument("--selftest", action="store_true")
     return p.parse_args()
 
@@ -778,15 +918,24 @@ def main() -> int:
         return 1
     data = path.read_bytes()
     key = parse_xor_key(args.xor_key) if args.xor_key else None
-    result = unwrap(data, max_layers=args.max_layers, xor_key=key)
+    result = unwrap(
+        data,
+        max_layers=args.max_layers,
+        xor_key=key,
+        password=args.password,
+    )
     info = " -> ".join(result.layers) if result.layers else "none"
     print("# layers: %s" % info, file=sys.stderr)
     out = result.data
+    if args.no_clean and ast_ok(out):
+        pass
+    elif ast_ok(out) and (not result.layers or result.layers[-1] != "clean"):
+        out = clean_source(out)
     if not out.endswith(b"\n"):
         out += b"\n"
     if args.output:
         Path(args.output).write_bytes(out)
-        print("# wrote %s" % args.output, file=sys.stderr)
+        print("# wrote %s (%d bytes)" % (args.output, len(out)), file=sys.stderr)
     else:
         sys.stdout.buffer.write(out)
     return 0
