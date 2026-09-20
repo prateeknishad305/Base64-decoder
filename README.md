@@ -80,11 +80,14 @@ Python 3.8+.
 - XOR (auto single-byte or `--xor-key`)
 - hex, rot13, reverse, byte shift
 - `exec(base64.b64decode(...))` and nested decode AST chains
+- Aliased imports (`import base64 as zxxx`) plus concatenated string XOR keys
+- Repeating-key XOR (`bytes(d[i] ^ k[i % len(k)] ...)`) then `marshal.loads`
 - TitanCrypt stubs (`_DATA` / `_METHOD` / `_decrypt`) using the password already in the file
 - Source cleanup via `ast.unparse` so output is full readable Python
 
-Typical stack:
+Typical stacks:
 
 ```text
 exec(marshal.loads(zlib.decompress(base64.b64decode(...))))
+exec(marshal.loads(xor(base64.b64decode(payload), key)))
 ```

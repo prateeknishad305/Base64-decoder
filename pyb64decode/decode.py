@@ -70,6 +70,19 @@ WRAPPERS = (
     b"codecs.decode",
     b"_decrypt(",
     b"TITAN_ENC_",
+    b".b64decode",
+    b".loads(",
+)
+KNOWN_MODULES = (
+    "base64",
+    "zlib",
+    "gzip",
+    "lzma",
+    "bz2",
+    "marshal",
+    "codecs",
+    "bytes",
+    "bytearray",
 )
 
 
@@ -122,13 +135,32 @@ def ast_ok(data: bytes) -> bool:
     return tree is not None and not trivial_ast(tree)
 
 
+def is_loader_stub(data: bytes) -> bool:
+    if is_titan(data):
+        return True
+    tree = parse_tree(data)
+    if tree is None or len(tree.body) > 48:
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id in ("exec", "eval"):
+                return True
+        if isinstance(node, ast.Attribute) and node.attr in (
+            "loads",
+            "b64decode",
+            "decompress",
+        ):
+            return True
+    blob = data.lower()
+    return b"exec(" in blob or b"marshal" in blob or b"b64decode" in blob
+
+
 def finished_python(data: bytes) -> bool:
     if not ast_ok(data):
         return False
-    if is_titan(data):
+    if is_titan(data) or is_loader_stub(data):
         return False
-    lowered = data[:8000].lower()
-    return not any(w in lowered for w in WRAPPERS)
+    return True
 
 
 def is_pyc(data: bytes) -> bool:
@@ -406,93 +438,188 @@ SAFE_ATTR = {
 }
 
 
-def eval_node(node):
+class EvalEnv:
+    def __init__(self):
+        self.aliases = {}
+        self.consts = {}
+        self.funcs = {}
+
+
+def collect_env(tree) -> EvalEnv:
+    env = EvalEnv()
+    for node in getattr(tree, "body", []):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in KNOWN_MODULES:
+                    env.aliases[alias.asname or alias.name] = alias.name
+        elif isinstance(node, ast.ImportFrom):
+            if node.module in KNOWN_MODULES:
+                for alias in node.names:
+                    env.aliases[alias.asname or alias.name] = (node.module, alias.name)
+        elif isinstance(node, ast.Assign):
+            if isinstance(node.value, ast.Lambda):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        env.funcs[target.id] = node.value
+                continue
+            val = eval_node(node.value, env)
+            if val is _FAIL:
+                val = literal_value(node.value)
+            if val is None or val is _FAIL:
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    env.consts[target.id] = val
+    return env
+
+
+def eval_node(node, env=None):
+    env = env or EvalEnv()
     if isinstance(node, ast.Name):
-        if node.id in (
-            "base64",
-            "zlib",
-            "gzip",
-            "lzma",
-            "bz2",
-            "marshal",
-            "codecs",
-            "bytes",
-            "bytearray",
-        ):
+        if node.id in env.consts:
+            return env.consts[node.id]
+        if node.id in env.funcs:
+            return env.funcs[node.id]
+        if node.id in env.aliases:
+            return env.aliases[node.id]
+        if node.id in KNOWN_MODULES:
             return node.id
         return _FAIL
     if isinstance(node, ast.Attribute):
-        parent = eval_node(node.value)
+        parent = eval_node(node.value, env)
         if parent is _FAIL:
             return _FAIL
         if isinstance(parent, str):
             return (parent, node.attr)
         return _FAIL
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        left = eval_node(node.left)
-        right = eval_node(node.right)
+    if isinstance(node, ast.Subscript):
+        seq = eval_node(node.value, env)
+        sl = node.slice
+        if hasattr(ast, "Index") and isinstance(sl, ast.Index):
+            sl = sl.value
+        idx = eval_node(sl, env)
+        if seq is _FAIL or idx is _FAIL:
+            return _FAIL
+        try:
+            return seq[idx]
+        except Exception:
+            return _FAIL
+    if isinstance(node, ast.BinOp):
+        left = eval_node(node.left, env)
+        right = eval_node(node.right, env)
         if left is _FAIL or right is _FAIL:
             return _FAIL
         try:
-            return left + right
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if isinstance(node.op, ast.Mod):
+                return left % right
+            if isinstance(node.op, ast.BitXor):
+                if isinstance(left, int) and isinstance(right, int):
+                    return left ^ right
+                if isinstance(left, (bytes, bytearray)) and isinstance(right, int):
+                    return xor_bytes(bytes(left), right)
+                if isinstance(right, (bytes, bytearray)) and isinstance(left, int):
+                    return xor_bytes(bytes(right), left)
+                if isinstance(left, (bytes, bytearray)) and isinstance(
+                    right, (bytes, bytearray)
+                ):
+                    return xor_bytes(bytes(left), bytes(right))
         except Exception:
             return _FAIL
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
-        left = eval_node(node.left)
-        right = eval_node(node.right)
-        if left is _FAIL or right is _FAIL:
-            return _FAIL
-        try:
-            return left * right
-        except Exception:
-            return _FAIL
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitXor):
-        left = eval_node(node.left)
-        right = eval_node(node.right)
-        if left is _FAIL or right is _FAIL:
-            return _FAIL
-        if isinstance(left, int) and isinstance(right, int):
-            return left ^ right
-        if isinstance(left, (bytes, bytearray)) and isinstance(right, int):
-            return xor_bytes(bytes(left), right)
-        if isinstance(right, (bytes, bytearray)) and isinstance(left, int):
-            return xor_bytes(bytes(right), left)
         return _FAIL
     if isinstance(node, ast.Call):
-        return eval_call(node)
+        return eval_call(node, env)
     if isinstance(node, ast.GeneratorExp):
-        return eval_xor_gen(node)
+        return eval_xor_gen(node, env)
     if isinstance(node, ast.ListComp):
         fake = ast.GeneratorExp(elt=node.elt, generators=node.generators)
-        return eval_xor_gen(fake)
+        return eval_xor_gen(fake, env)
+    if isinstance(node, ast.Lambda):
+        return node
     v = literal_value(node)
     return v if v is not None else _FAIL
 
 
-def eval_xor_gen(node: ast.GeneratorExp):
+def _comp_data_key(elt, env):
+    if not isinstance(elt, ast.BinOp) or not isinstance(elt.op, ast.BitXor):
+        return None
+    sides = (elt.left, elt.right)
+    data_node = key_node = None
+    for side in sides:
+        if isinstance(side, ast.Subscript):
+            base = eval_node(side.value, env)
+            if isinstance(base, (bytes, bytearray)):
+                sl = side.slice
+                if hasattr(ast, "Index") and isinstance(sl, ast.Index):
+                    sl = sl.value
+                if isinstance(sl, ast.BinOp) and isinstance(sl.op, ast.Mod):
+                    key_node = side.value
+                else:
+                    data_node = side.value
+    if data_node is None or key_node is None:
+        return None
+    data = eval_node(data_node, env)
+    key = eval_node(key_node, env)
+    if isinstance(data, (bytes, bytearray)) and isinstance(key, (bytes, bytearray)) and key:
+        return xor_bytes(bytes(data), bytes(key))
+    return None
+
+
+def eval_xor_gen(node: ast.GeneratorExp, env=None):
+    env = env or EvalEnv()
     if len(node.generators) != 1 or node.generators[0].ifs:
         return _FAIL
+    repeated = _comp_data_key(node.elt, env)
+    if repeated is not None:
+        return repeated
     gen = node.generators[0]
-    seq = eval_node(gen.iter)
-    if not isinstance(seq, (bytes, bytearray, list, tuple)):
+    seq = eval_node(gen.iter, env)
+    if not isinstance(seq, (bytes, bytearray, list, tuple, range)):
         return _FAIL
     elt = node.elt
     if not isinstance(elt, ast.BinOp) or not isinstance(elt.op, ast.BitXor):
         return _FAIL
     key = None
     if isinstance(elt.left, ast.Name) and elt.left.id == gen.target.id:
-        key = eval_node(elt.right)
+        key = eval_node(elt.right, env)
     elif isinstance(elt.right, ast.Name) and elt.right.id == gen.target.id:
-        key = eval_node(elt.left)
-    if not isinstance(key, int):
+        key = eval_node(elt.left, env)
+    if isinstance(key, int) and isinstance(seq, (bytes, bytearray, list, tuple)):
+        return xor_bytes(bytes(seq), key)
+    return _FAIL
+
+
+def apply_lambda(fn: ast.Lambda, args, env: EvalEnv):
+    names = [a.arg for a in fn.args.args]
+    if len(args) < len(names):
         return _FAIL
-    return xor_bytes(bytes(seq), key)
+    child = EvalEnv()
+    child.aliases = dict(env.aliases)
+    child.consts = dict(env.consts)
+    child.funcs = dict(env.funcs)
+    for name, val in zip(names, args):
+        child.consts[name] = val
+    return eval_node(fn.body, child)
 
 
-def eval_call(node: ast.Call):
+def eval_call(node: ast.Call, env=None):
+    env = env or EvalEnv()
+    func = node.func
+    if isinstance(func, ast.Name) and func.id in ("bytes", "bytearray") and node.args:
+        first = node.args[0]
+        if isinstance(first, (ast.GeneratorExp, ast.ListComp)):
+            got = eval_node(first, env)
+            if got is not _FAIL and got is not None:
+                try:
+                    return bytes(got)
+                except Exception:
+                    return _FAIL
     args = []
     for a in node.args:
-        v = eval_node(a)
+        v = eval_node(a, env)
         if v is _FAIL:
             return _FAIL
         args.append(v)
@@ -500,14 +627,23 @@ def eval_call(node: ast.Call):
     for kw in node.keywords:
         if kw.arg is None:
             return _FAIL
-        v = eval_node(kw.value)
+        v = eval_node(kw.value, env)
         if v is _FAIL:
             return _FAIL
         kwargs[kw.arg] = v
-    func = node.func
+    if isinstance(func, ast.Name) and func.id == "len":
+        try:
+            return len(args[0])
+        except Exception:
+            return _FAIL
+    if isinstance(func, ast.Name) and func.id == "range":
+        try:
+            return range(*args)
+        except Exception:
+            return _FAIL
     if isinstance(func, ast.Name) and func.id in ("bytes", "bytearray"):
         try:
-            if args and isinstance(args[0], (list, tuple)):
+            if args and isinstance(args[0], (list, tuple, range)):
                 return bytes(args[0])
             if args and isinstance(args[0], (bytes, bytearray, str)):
                 return bytes(*args, **kwargs)
@@ -516,6 +652,12 @@ def eval_call(node: ast.Call):
         return _FAIL
     if isinstance(func, ast.Name) and func.id in ("exec", "eval", "compile"):
         return args[0] if args else _FAIL
+    if isinstance(func, ast.Name) and func.id == "globals":
+        return {}
+    if isinstance(func, ast.Name) and func.id in env.funcs:
+        return apply_lambda(env.funcs[func.id], args, env)
+    if isinstance(func, ast.Lambda):
+        return apply_lambda(func, args, env)
     if (
         isinstance(func, ast.Attribute)
         and func.attr == "fromhex"
@@ -530,7 +672,7 @@ def eval_call(node: ast.Call):
         except Exception:
             return _FAIL
     if isinstance(func, ast.Attribute) and func.attr in ("decode", "encode"):
-        val = eval_node(func.value)
+        val = eval_node(func.value, env)
         if val is _FAIL:
             return _FAIL
         try:
@@ -541,12 +683,21 @@ def eval_call(node: ast.Call):
         except Exception:
             return _FAIL
         return _FAIL
-    target = eval_node(func) if not isinstance(func, ast.Name) else func.id
+    target = eval_node(func, env)
+    if isinstance(target, ast.Lambda):
+        return apply_lambda(target, args, env)
     if isinstance(target, tuple) and target in SAFE_ATTR:
         try:
             return SAFE_ATTR[target](args, kwargs)
         except Exception:
             return _FAIL
+    if isinstance(func, ast.Name) and func.id in env.aliases:
+        mapped = env.aliases[func.id]
+        if isinstance(mapped, tuple) and mapped in SAFE_ATTR:
+            try:
+                return SAFE_ATTR[mapped](args, kwargs)
+            except Exception:
+                return _FAIL
     return _FAIL
 
 
@@ -555,13 +706,14 @@ def unwrap_exec_ast(text: str):
         tree = ast.parse(text)
     except SyntaxError:
         return None
+    env = collect_env(tree)
     best = None
     best_score = -1
 
     class Visitor(ast.NodeVisitor):
         def visit_Call(self, node):
             nonlocal best, best_score
-            val = eval_node(node)
+            val = eval_node(node, env)
             blob, sc = _payload_score(val)
             if blob is not None and sc > best_score and blob != text.encode("utf-8"):
                 best = blob
@@ -570,7 +722,7 @@ def unwrap_exec_ast(text: str):
 
         def visit_Assign(self, node):
             nonlocal best, best_score
-            val = eval_node(node.value)
+            val = eval_node(node.value, env)
             blob, sc = _payload_score(val)
             if blob is not None and sc > best_score and len(blob) > 16:
                 best = blob
@@ -876,6 +1028,24 @@ def selftest() -> int:
         (
             "nested-titan",
             ("exec(base64.b64decode(%r))\n" % base64.b64encode(_titan_stub(base64.b64encode(src), 1)).decode("ascii")).encode(),
+            b"ok-layer",
+        ),
+        (
+            "alias-xor-marshal",
+            (
+                "import marshal as zm\n"
+                "import base64 as zb\n"
+                "za='AAAA'\n"
+                "zbk='BBBB'\n"
+                "K=zb.b64decode(za+zbk)\n"
+                "P=%r\n"
+                "xor=lambda d,k: bytes(d[i]^k[i%%len(k)] for i in range(len(d)))\n"
+                "run=lambda c: exec(c, globals())\n"
+                "run(zm.loads(xor(zb.b64decode(P), K)))\n"
+                % base64.b64encode(
+                    xor_bytes(dumped, base64.b64decode(b"AAAABBBB"))
+                ).decode("ascii")
+            ).encode(),
             b"ok-layer",
         ),
     ]
